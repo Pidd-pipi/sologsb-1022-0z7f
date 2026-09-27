@@ -252,6 +252,7 @@ export const initialDocument: TextDocument = {
   chapters,
   annotations,
   snapshots: [initialSnapshot],
+  resolutionLog: [],
   updatedAt: FIXED_TIME
 };
 

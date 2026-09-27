@@ -3,6 +3,7 @@ import type {
   AnnotationKind,
   ConflictGroup,
   EditorState,
+  ResolutionLogEntry,
   SearchResult,
   Sentence,
   TextDocument,
@@ -294,6 +295,73 @@ export function removeAnnotationReferences(document: TextDocument, removedId: st
   for (const annotation of document.annotations) {
     annotation.references = annotation.references.filter((id) => id !== removedId);
   }
+}
+
+export function recordResolution(
+  document: TextDocument,
+  group: ConflictGroup,
+  winnerId: string,
+  mergeBodies: boolean
+): ResolutionLogEntry | null {
+  const winner = document.annotations.find((annotation) => annotation.id === winnerId);
+  if (!winner) return null;
+  const now = new Date().toISOString();
+  const sources = group.annotations.map((item) => ({
+    annotationId: item.id,
+    source: item.source,
+    title: item.title,
+    body: item.body
+  }));
+
+  let mergedBody: string | undefined;
+  if (mergeBodies) {
+    mergedBody = group.annotations.map((item) => `【${item.source}】${item.body}`).join('\n\n');
+    winner.body = mergedBody;
+  }
+  for (const item of document.annotations) {
+    if (item.anchorId !== group.anchorId || item.kind !== group.kind) continue;
+    item.conflictState = 'resolved';
+    item.conflictResolution = `${now} · ${mergeBodies ? '合并条文，以' : '选用'} ${winner.source}`;
+    item.updatedAt = now;
+  }
+
+  const entry: ResolutionLogEntry = {
+    id: `resolution-${Date.now().toString(36)}-${document.resolutionLog.length}`,
+    createdAt: now,
+    action: mergeBodies ? 'merge' : 'select',
+    anchorId: group.anchorId,
+    anchorType: group.anchorType,
+    kind: group.kind,
+    anchorLabel: group.anchorLabel,
+    winnerId,
+    winnerSource: winner.source,
+    mergedBody,
+    sources,
+    undone: false
+  };
+  document.resolutionLog.push(entry);
+  return entry;
+}
+
+export function getLatestActiveResolution(document: TextDocument): ResolutionLogEntry | undefined {
+  return document.resolutionLog.filter((entry) => !entry.undone).at(-1);
+}
+
+export function revertResolution(document: TextDocument, entryId: string): ResolutionLogEntry | null {
+  const entry = document.resolutionLog.find((item) => item.id === entryId);
+  if (!entry || entry.undone) return null;
+  const now = new Date().toISOString();
+  for (const snapshot of entry.sources) {
+    const annotation = document.annotations.find((item) => item.id === snapshot.annotationId);
+    if (!annotation) continue;
+    annotation.body = snapshot.body;
+    annotation.conflictState = 'open';
+    delete annotation.conflictResolution;
+    annotation.updatedAt = now;
+  }
+  entry.undone = true;
+  entry.undoneAt = now;
+  return entry;
 }
 
 export function toWorkspace(document: TextDocument, fallback: WorkspaceState): WorkspaceState {
