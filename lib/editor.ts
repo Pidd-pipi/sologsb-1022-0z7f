@@ -27,6 +27,15 @@ export function createInitialWorkspace(document: TextDocument): WorkspaceState {
   };
 }
 
+export function normalizeDocument(document: TextDocument): TextDocument {
+  document.resolutionTrail ??= [];
+  for (const entry of document.resolutionTrail) {
+    entry.sources ??= [];
+    entry.undone ??= false;
+  }
+  return document;
+}
+
 export function createInitialEditorState(document: TextDocument): EditorState {
   return {
     workspace: createInitialWorkspace(document),

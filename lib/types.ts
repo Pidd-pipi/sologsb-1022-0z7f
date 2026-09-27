@@ -39,6 +39,32 @@ export interface Annotation {
   updatedAt: string;
 }
 
+export type ResolutionAction = 'pick' | 'merge';
+
+export interface ResolutionTrailSource {
+  annotationId: string;
+  source: string;
+  title: string;
+  body: string;
+}
+
+export interface ResolutionTrailEntry {
+  id: string;
+  anchorId: string;
+  anchorType: AnchorType;
+  kind: AnnotationKind;
+  anchorLabel: string;
+  action: ResolutionAction;
+  createdAt: string;
+  winnerId: string;
+  winnerSource: string;
+  sources: ResolutionTrailSource[];
+  winnerBodyBefore: string;
+  resultBody: string;
+  undone: boolean;
+  undoneAt?: string;
+}
+
 export interface VersionSnapshot {
   id: string;
   label: string;
@@ -56,6 +82,7 @@ export interface TextDocument {
   chapters: Chapter[];
   annotations: Annotation[];
   snapshots: VersionSnapshot[];
+  resolutionTrail: ResolutionTrailEntry[];
   updatedAt: string;
 }
 

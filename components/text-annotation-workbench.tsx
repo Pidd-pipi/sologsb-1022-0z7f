@@ -26,6 +26,7 @@ import {
   FileDown,
   FileJson,
   GitCompareArrows,
+  History,
   Keyboard,
   Link2,
   ListTree,
@@ -52,6 +53,7 @@ import {
   getSentence,
   getTargetLabel,
   kindLabel,
+  normalizeDocument,
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
@@ -60,6 +62,7 @@ import type {
   AnnotationKind,
   AnchorType,
   ConflictGroup,
+  ResolutionTrailEntry,
   Sentence,
   TextDocument,
   ViewMode,
@@ -123,10 +126,31 @@ function buildHtml(document: TextDocument) {
     )
     .join('\n');
 
+  const trailEntries = (document.resolutionTrail ?? [])
+    .map((entry) => {
+      const sources = entry.sources
+        .map(
+          (source) =>
+            `<li><b>${escapeHtml(source.source)}</b>（当时正文）：${escapeHtml(source.body)}</li>`
+        )
+        .join('');
+      const actionLabel = entry.action === 'merge' ? '合并条文' : '选用来源';
+      const status = entry.undone
+        ? ` <small>已撤回${entry.undoneAt ? `（${new Date(entry.undoneAt).toLocaleString('zh-CN')}）` : ''}，各来源已恢复待处理</small>`
+        : '';
+      return `<li><b>${actionLabel} · ${escapeHtml(entry.winnerSource)}</b> <span>${escapeHtml(
+        entry.anchorLabel
+      )}</span> <small>${new Date(entry.createdAt).toLocaleString('zh-CN')}</small>${status}<ul>${sources}</ul></li>`;
+    })
+    .join('\n');
+  const trailSection = trailEntries
+    ? `<hr><h2>来源处理轨迹</h2><ol>${trailEntries}</ol>`
+    : '';
+
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escapeHtml(document.title)}</title>
 <style>body{max-width:780px;margin:48px auto;padding:0 28px;font:17px/1.9 Georgia,"Noto Serif SC",serif;color:#29251f}h1{text-align:center}h2{margin-top:2.4em;border-bottom:1px solid #ddd;padding-bottom:.35em}.summary{color:#6b665d}li{margin:.8em 0}small{color:#777}</style></head>
 <body><h1>${escapeHtml(document.title)}</h1><p style="text-align:center">${escapeHtml(document.author)} · ${escapeHtml(document.edition)}</p>
-${sections}<hr><h2>注释与校记</h2><ol>${notes}</ol><p><small>导出时间：${new Date().toLocaleString('zh-CN')}</small></p></body></html>`;
+${sections}<hr><h2>注释与校记</h2><ol>${notes}</ol>${trailSection}<p><small>导出时间：${new Date().toLocaleString('zh-CN')}</small></p></body></html>`;
 }
 
 function sentenceAnnotationCount(document: TextDocument, sentence: Sentence) {
@@ -349,6 +373,11 @@ export function TextAnnotationWorkbench() {
   const selectedSentence = getSentence(document, workspace.selectedSentenceId);
   const conflicts = useMemo(() => getConflictGroups(document), [document]);
   const searchResults = useMemo(() => collectSearchResults(document, workspace.query), [document, workspace.query]);
+  const resolutionTrail = useMemo<ResolutionTrailEntry[]>(
+    () => [...(document.resolutionTrail ?? [])].reverse(),
+    [document.resolutionTrail]
+  );
+  const latestOpenResolutionId = resolutionTrail.find((item) => !item.undone)?.id ?? null;
 
   const anchor = pendingAnchor ?? {
     id: selectedSentence?.id ?? selectedChapter?.id ?? '',
@@ -364,6 +393,7 @@ export function TextAnnotationWorkbench() {
       if (raw) {
         const stored = JSON.parse(raw) as WorkspaceState;
         if (stored.document?.chapters?.length) {
+          normalizeDocument(stored.document);
           dispatch({ type: 'hydrate', workspace: stored });
           if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
         }
@@ -521,14 +551,67 @@ export function TextAnnotationWorkbench() {
       mutate: (doc) => {
         const winner = doc.annotations.find((annotation) => annotation.id === winnerId);
         if (!winner) return;
-        for (const item of doc.annotations) {
-          if (item.anchorId !== group.anchorId || item.kind !== group.kind) continue;
+        const members = doc.annotations.filter(
+          (item) => item.anchorId === group.anchorId && item.kind === group.kind && item.conflictState !== 'resolved'
+        );
+        const now = new Date().toISOString();
+        const sources = members.map((item) => ({
+          annotationId: item.id,
+          source: item.source,
+          title: item.title,
+          body: item.body
+        }));
+        const winnerBodyBefore = winner.body;
+        for (const item of members) {
           item.conflictState = 'resolved';
-          item.conflictResolution = `${new Date().toISOString()} · 选用 ${winner.source}`;
+          item.conflictResolution = `${now} · 选用 ${winner.source}`;
         }
         if (mergeBodies) {
-          winner.body = group.annotations.map((item) => `【${item.source}】${item.body}`).join('\n\n');
+          winner.body = members.map((item) => `【${item.source}】${item.body}`).join('\n\n');
         }
+        doc.resolutionTrail ??= [];
+        doc.resolutionTrail.push({
+          id: `resolution-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+          anchorId: group.anchorId,
+          anchorType: group.anchorType,
+          kind: group.kind,
+          anchorLabel: group.anchorLabel,
+          action: mergeBodies ? 'merge' : 'pick',
+          createdAt: now,
+          winnerId,
+          winnerSource: winner.source,
+          sources,
+          winnerBodyBefore,
+          resultBody: winner.body,
+          undone: false
+        });
+      }
+    });
+  }
+
+  function undoLastResolution() {
+    const entry = [...document.resolutionTrail].reverse().find((item) => !item.undone);
+    if (!entry) return;
+    dispatch({
+      type: 'commit',
+      label: '撤回最近一次来源处理',
+      mutate: (doc) => {
+        const target = doc.resolutionTrail.find((item) => item.id === entry.id);
+        if (!target || target.undone) return;
+        const now = new Date().toISOString();
+        for (const source of target.sources) {
+          const annotation = doc.annotations.find((item) => item.id === source.annotationId);
+          if (!annotation) continue;
+          annotation.conflictState = 'open';
+          delete annotation.conflictResolution;
+          annotation.updatedAt = now;
+        }
+        if (target.action === 'merge') {
+          const winner = doc.annotations.find((item) => item.id === target.winnerId);
+          if (winner) winner.body = target.winnerBodyBefore;
+        }
+        target.undone = true;
+        target.undoneAt = now;
       }
     });
   }
@@ -1007,6 +1090,66 @@ export function TextAnnotationWorkbench() {
                           <p className="mt-1 text-xs text-green-700">已解决记录仍保留在各注释的来源字段中。</p>
                         </div>
                       ) : null}
+
+                      <Divider />
+
+                      <div className="flex items-center justify-between">
+                        <h3 className="flex items-center gap-2 font-semibold text-stone-900">
+                          <History className="h-4 w-4" />处理轨迹
+                        </h3>
+                        <Chip size="sm" variant="flat">{resolutionTrail.length} 条</Chip>
+                      </div>
+                      <p className="text-[11px] leading-5 text-stone-500">
+                        每次选用或合并都会记录时间、动作与各来源当时正文；最近一次处理可撤回，撤回后来源重新待处理、合并前正文恢复。
+                      </p>
+                      {resolutionTrail.length ? resolutionTrail.map((entry) => (
+                        <Card
+                          key={entry.id}
+                          shadow="none"
+                          className={`border ${entry.undone ? 'border-stone-200 opacity-70' : 'border-amber-200 bg-amber-50/40'}`}
+                        >
+                          <CardBody className="gap-2 p-3">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Chip size="sm" color={entry.action === 'merge' ? 'secondary' : 'primary'} variant="flat">
+                                {entry.action === 'merge' ? '合并条文' : '选用来源'}
+                              </Chip>
+                              <span className="text-xs font-semibold text-stone-800">{entry.winnerSource}</span>
+                              <Chip size="sm" variant="bordered">{kindLabel(entry.kind)}</Chip>
+                              {entry.undone ? <Chip size="sm" color="default" variant="bordered">已撤回</Chip> : null}
+                            </div>
+                            <p className="line-clamp-2 font-serif text-xs text-stone-600">{entry.anchorLabel}</p>
+                            <p className="text-[11px] text-stone-500">
+                              处理于 {new Date(entry.createdAt).toLocaleString('zh-CN')}
+                              {entry.undone && entry.undoneAt ? ` · 撤回于 ${new Date(entry.undoneAt).toLocaleString('zh-CN')}` : ''}
+                            </p>
+                            <div className="space-y-1 rounded-lg bg-stone-50 p-2">
+                              {entry.sources.map((source) => (
+                                <p key={source.annotationId} className="text-[11px] leading-4 text-stone-600">
+                                  <b className="text-stone-800">{source.source}</b>（当时正文）：{source.body}
+                                </p>
+                              ))}
+                            </div>
+                            {entry.action === 'merge' ? (
+                              <p className="line-clamp-3 text-[11px] leading-4 text-stone-500">合并结果：{entry.resultBody}</p>
+                            ) : null}
+                            {!entry.undone && entry.id === latestOpenResolutionId ? (
+                              <Button
+                                size="sm"
+                                variant="flat"
+                                color="warning"
+                                startContent={<Undo2 className="h-3.5 w-3.5" />}
+                                onPress={undoLastResolution}
+                              >
+                                撤回此次处理
+                              </Button>
+                            ) : null}
+                          </CardBody>
+                        </Card>
+                      )) : (
+                        <p className="rounded-lg border border-dashed border-stone-300 p-4 text-center text-xs text-stone-500">
+                          尚无处理记录。选用或合并来源后，时间、动作与各来源当时正文会留在这里，可核对、可撤回。
+                        </p>
+                      )}
                     </div>
                   </ScrollShadow>
                 </Tab>
